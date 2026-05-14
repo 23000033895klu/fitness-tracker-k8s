@@ -1,0 +1,131 @@
+---
+# ── Inventory: inventory/hosts.yml ───────────────────────────────────────────
+# all:
+#   children:
+#     k8s_master:
+#       hosts:
+#         master1: { ansible_host: <EC2_IP>, ansible_user: ec2-user }
+#     k8s_workers:
+#       hosts:
+#         worker1: { ansible_host: <EC2_IP>, ansible_user: ec2-user }
+
+# ── Main Playbook ─────────────────────────────────────────────────────────────
+- name: Provision K8s nodes on AWS EC2
+  hosts: all
+  become: true
+  vars:
+    k8s_version: "1.28"
+    docker_version: "24.0"
+
+  tasks:
+    - name: Update all packages
+      yum:
+        name: "*"
+        state: latest
+
+    - name: Install required packages
+      yum:
+        name:
+          - curl
+          - wget
+          - git
+          - unzip
+          - awscli
+        state: present
+
+    - name: Add Docker repo
+      get_url:
+        url: https://download.docker.com/linux/centos/docker-ce.repo
+        dest: /etc/yum.repos.d/docker-ce.repo
+
+    - name: Install Docker
+      yum:
+        name: docker-ce
+        state: present
+
+    - name: Start and enable Docker
+      systemd:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Add ec2-user to docker group
+      user:
+        name: ec2-user
+        groups: docker
+        append: true
+
+    - name: Disable swap (K8s requirement)
+      shell: swapoff -a && sed -i '/swap/d' /etc/fstab
+
+    - name: Set kernel params for K8s networking
+      sysctl:
+        name: "{{ item }}"
+        value: "1"
+        sysctl_set: true
+        reload: true
+      loop:
+        - net.bridge.bridge-nf-call-iptables
+        - net.bridge.bridge-nf-call-ip6tables
+        - net.ipv4.ip_forward
+
+    - name: Add Kubernetes repo
+      copy:
+        dest: /etc/yum.repos.d/kubernetes.repo
+        content: |
+          [kubernetes]
+          name=Kubernetes
+          baseurl=https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/rpm/
+          enabled=1
+          gpgcheck=1
+          gpgkey=https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/rpm/repodata/repomd.xml.key
+
+    - name: Install kubeadm, kubelet, kubectl
+      yum:
+        name:
+          - kubeadm
+          - kubelet
+          - kubectl
+        state: present
+
+    - name: Enable kubelet
+      systemd:
+        name: kubelet
+        enabled: true
+        state: started
+
+- name: Initialize K8s master node
+  hosts: k8s_master
+  become: true
+  tasks:
+    - name: Initialize cluster
+      shell: kubeadm init --pod-network-cidr=10.244.0.0/16
+      args:
+        creates: /etc/kubernetes/admin.conf
+
+    - name: Set up kubeconfig for ec2-user
+      shell: |
+        mkdir -p /home/ec2-user/.kube
+        cp /etc/kubernetes/admin.conf /home/ec2-user/.kube/config
+        chown ec2-user:ec2-user /home/ec2-user/.kube/config
+
+    - name: Install Flannel CNI
+      become: false
+      shell: kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
+
+    - name: Get join command
+      shell: kubeadm token create --print-join-command
+      register: join_command
+
+    - name: Save join command
+      set_fact:
+        k8s_join_command: "{{ join_command.stdout }}"
+
+- name: Join worker nodes
+  hosts: k8s_workers
+  become: true
+  tasks:
+    - name: Join cluster
+      shell: "{{ hostvars[groups['k8s_master'][0]]['k8s_join_command'] }}"
+      args:
+        creates: /etc/kubernetes/kubelet.conf

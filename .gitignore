@@ -1,0 +1,10 @@
+node_modules/
+coverage/
+build/
+.env
+.env.*
+*.tfstate
+*.tfstate.backup
+.terraform/
+*.pem
+*.key
